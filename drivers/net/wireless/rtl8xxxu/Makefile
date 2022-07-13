@@ -1,19 +1,20 @@
-obj-$(CONFIG_RTWIFI)	+= rtwifi.o
+# SPDX-Lincense-Identifier: GPL-2.0-only
+obj-$(CONFIG_RTL8XXXU)	+= rtl8xxxu.o
 
-rtwifi-y	:= rtl8xxxu_core.o rtl8xxxu_8192e.o rtl8xxxu_8723b.o \
+rtl8xxxu-y	:= rtl8xxxu_core.o rtl8xxxu_8192e.o rtl8xxxu_8723b.o \
 		   rtl8xxxu_8723a.o rtl8xxxu_8192c.o rtl8xxxu_8188e.o
 
 
 KVER := $(shell uname -r)
 KSRC := /lib/modules/$(KVER)/build
-MODDESTDIR := /lib/modules/$(KVER)/kernel/drivers/net/wireless/realtek/
+MODDESTDIR := /lib/modules/$(KVER)/kernel/drivers/net/wireless/
 
 all: modules
 
 modules:
 	$(MAKE) -C $(KSRC) M=$(shell pwd) modules
 
-MODULE_NAME = rtwifi
+MODULE_NAME = rtl8xxxu
 
 install: modules
 	#gzip -f $(MODULE_NAME).ko
