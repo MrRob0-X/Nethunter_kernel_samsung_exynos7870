@@ -614,6 +614,7 @@
 
 	i2c@13840000 {
 		touchscreen@49 {
+                        compatible = "stm,d_fts_touch";
 			stm,project_name = "gtaxl_rev03", "T580";
 			stm,regulator_dvdd = "tsp_dvdd";
 			stm,regulator_avdd = "tsp_avdd";
