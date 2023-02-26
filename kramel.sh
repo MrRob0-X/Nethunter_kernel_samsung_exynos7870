@@ -74,6 +74,7 @@ if [[ "${COMPILER}" = gcc ]]; then
     MAKE+=(
         ARCH=arm64
         O=out
+	LD_LIBRARY_PATH="${KDIR}"/gcc64/bin:/$LD_LIBRARY_PATH
         CROSS_COMPILE=aarch64-linux-gnu-
     )
 
