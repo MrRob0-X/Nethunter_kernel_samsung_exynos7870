@@ -47,6 +47,11 @@ export version
 PROCS=$(nproc --all)
 export PROCS
 
+# Flag: set to 1 if "hdr" is passed as an argument.
+HEADERS=0
+for _a in "$@"; do [[ "$_a" == "hdr" ]] && HEADERS=1; done
+export HEADERS
+
 # Compiler to use for builds.
 export COMPILER=gcc
 
@@ -248,6 +253,258 @@ mod() {
     echo -e "\n\e[1;32m[✓] Built Modules! \e[0m"
 }
 
+# A function to build kernel headers
+hdr() {
+    if [[ "${TGI}" != "0" ]]; then
+        tg "*Building Kernel Headers!*"
+    fi
+    rgn
+    echo -e "\n\e[1;94m[*] Building Kernel Headers \e[0m"
+
+    local arch
+    arch="$(printf "%s\n" "${MAKE[@]}" | awk -F= '/^ARCH=/{print $2}')"
+
+    local ver codename pkgname
+    ver="$(grep -E '^(VERSION|PATCHLEVEL|SUBLEVEL)' Makefile | awk '{print $3}' | paste -sd.)"
+    codename="${CODENAME}"
+    pkgname="linux-headers-${ver}-${codename}.deb"
+
+    local pkgdir="${KDIR}/deb-pkg"
+    local hdrdir="${pkgdir}/usr/src/linux-headers-${ver}-${codename}"
+    rm -rf "${pkgdir}"
+    mkdir -p "${pkgdir}/DEBIAN"
+    mkdir -p "${hdrdir}"
+
+    # ------------------------------------------------------------------
+    # Step 1: Set up ARM64 OpenSSL and libyaml headers/libraries
+    # ------------------------------------------------------------------
+    local SYSROOT="${KDIR}/arm64-sysroot"
+    mkdir -p "${SYSROOT}"
+
+    # --- OpenSSL ---
+    local OPENSSL_DEV_PKG="libssl-dev_3.0.2-0ubuntu1_arm64.deb"
+    local OPENSSL_URL="http://ports.ubuntu.com/pool/main/o/openssl/${OPENSSL_DEV_PKG}"
+    local SSL_SENTINEL="${SYSROOT}/.openssl_ready"
+
+    if [ ! -f "${SSL_SENTINEL}" ]; then
+        echo -e "\n\e[1;93m[*] Setting up ARM64 OpenSSL in ${SYSROOT} ...\e[0m"
+        pushd "${SYSROOT}" >/dev/null || exit 1
+        if [ ! -f "${OPENSSL_DEV_PKG}" ]; then
+            wget "${OPENSSL_URL}" || {
+                echo -e "\e[1;31m[✗] Failed to download ${OPENSSL_DEV_PKG}\e[0m"
+                exit 1
+            }
+        fi
+        dpkg-deb -x "${OPENSSL_DEV_PKG}" .
+        touch "${SSL_SENTINEL}"
+        popd >/dev/null || exit 1
+    fi
+
+    # --- libyaml ---
+    local YAML_DEV_PKG="libyaml-dev_0.2.5-2_arm64.deb"
+    local YAML_URL="http://ports.ubuntu.com/pool/main/liby/libyaml/${YAML_DEV_PKG}"
+    local YAML_SENTINEL="${SYSROOT}/.libyaml_ready"
+
+    if [ ! -f "${YAML_SENTINEL}" ]; then
+        echo -e "\n\e[1;93m[*] Setting up ARM64 libyaml-dev in ${SYSROOT} ...\e[0m"
+        pushd "${SYSROOT}" >/dev/null || exit 1
+        if [ ! -f "${YAML_DEV_PKG}" ]; then
+            wget "${YAML_URL}" || {
+                echo -e "\e[1;31m[✗] Failed to download ${YAML_DEV_PKG}\e[0m"
+                exit 1
+            }
+        fi
+        dpkg-deb -x "${YAML_DEV_PKG}" .
+        touch "${YAML_SENTINEL}"
+        popd >/dev/null || exit 1
+    fi
+
+    # Flags for host tools (OpenSSL + libyaml)
+    local HOST_CFLAGS="-I${SYSROOT}/usr/include -I${SYSROOT}/usr/include/aarch64-linux-gnu"
+    local HOST_LDFLAGS="-L${SYSROOT}/usr/lib/aarch64-linux-gnu"
+
+    # ------------------------------------------------------------------
+    # Step 2: Prepare the kernel build tree and cross‑compile host tools
+    # ------------------------------------------------------------------
+
+    echo -e "\n\e[1;93m[*] Running prepare + modules_prepare with out/ \e[0m"
+
+    # Override HOSTCC, HOSTCXX to build scripts/ binaries for aarch64
+    make O=out ARCH=arm64 \
+         CROSS_COMPILE=/usr/bin/aarch64-linux-gnu- \
+         CC=/usr/bin/aarch64-linux-gnu-gcc \
+         LD=/usr/bin/aarch64-linux-gnu-ld \
+         AS=/usr/bin/aarch64-linux-gnu-as \
+         AR=/usr/bin/aarch64-linux-gnu-ar \
+         NM=/usr/bin/aarch64-linux-gnu-nm \
+         STRIP=/usr/bin/aarch64-linux-gnu-strip \
+         OBJCOPY=/usr/bin/aarch64-linux-gnu-objcopy \
+         OBJDUMP=/usr/bin/aarch64-linux-gnu-objdump \
+         HOSTCC="/usr/bin/aarch64-linux-gnu-gcc -static ${HOST_CFLAGS} ${HOST_LDFLAGS}" \
+         HOSTCXX="/usr/bin/aarch64-linux-gnu-g++ -static ${HOST_CFLAGS} ${HOST_LDFLAGS}" \
+         HOSTLD=/usr/bin/aarch64-linux-gnu-ld \
+         HOSTLDFLAGS="" HOSTCFLAGS="" \
+         olddefconfig prepare modules_prepare
+
+    # ------------------------------------------------------------------
+    # Step 3: Collect source-tree files
+    # ------------------------------------------------------------------
+    echo -e "\n\e[1;93m[*] Collecting source tree files \e[0m"
+    (cd "${KDIR}" && find . \
+        \( -name "Makefile*" -o -name "Kconfig*" -o -name "*.pl" \) \
+        -not \( -path "./out/*" -o -path "./deb-pkg/*" -o -path "./.git/*" \) \
+        -type f \
+        | tar --no-recursion -T - -cf - \
+    ) | tar -xf - -C "${hdrdir}"
+
+    (cd "${KDIR}" && find scripts -name "*.sh" -type f \
+        | tar --no-recursion -T - -cf - \
+    ) | tar -xf - -C "${hdrdir}"
+
+    (cd "${KDIR}" && find arch/*/include -type f \
+        | tar --no-recursion -T - -cf - \
+    ) | tar -xf - -C "${hdrdir}"
+
+    (cd "${KDIR}" && find "arch/${arch}" \
+        \( -name "module.lds" -o -name "Kbuild.platforms" -o -name "Platform" \) \
+        -type f \
+        | tar --no-recursion -T - -cf - \
+    ) | tar -xf - -C "${hdrdir}"
+
+    (cd "${KDIR}" && find include -type f \
+        | tar --no-recursion -T - -cf - \
+    ) | tar -xf - -C "${hdrdir}"
+
+    (cd "${KDIR}" && find scripts -type f \
+        | tar --no-recursion -T - -cf - \
+    ) | tar -xf - -C "${hdrdir}"
+
+    if [ -d "${KDIR}/security" ]; then
+        (cd "${KDIR}" && find security -type f \
+            | tar --no-recursion -T - -cf - \
+        ) | tar -xf - -C "${hdrdir}"
+    fi
+
+    if [ -d "${KDIR}/tools" ]; then
+        (cd "${KDIR}" && find tools -type f \
+            | tar --no-recursion -T - -cf - \
+        ) | tar -xf - -C "${hdrdir}"
+    fi
+
+    if [ -d "${KDIR}/techpack" ]; then
+        (cd "${KDIR}" && find techpack \
+            \( -name "Makefile*" -o -name "Kconfig*" \) \
+            -type f \
+            | tar --no-recursion -T - -cf - \
+        ) | tar -xf - -C "${hdrdir}"
+    fi
+
+    # ------------------------------------------------------------------
+    # Step 4: Collect build-tree (out/) generated files
+    # ------------------------------------------------------------------
+    echo -e "\n\e[1;93m[*] Collecting out/ (objtree) generated files \e[0m"
+    (cd "${KDIR}/out" && find include -type f \
+        | tar --no-recursion -T - -cf - \
+    ) | tar -xf - -C "${hdrdir}"
+
+    (cd "${KDIR}/out" && find "arch/${arch}/include" -type f \
+        | tar --no-recursion -T - -cf - \
+    ) | tar -xf - -C "${hdrdir}"
+
+    if [ -d "${KDIR}/out/scripts" ]; then
+        (cd "${KDIR}/out" && find scripts -type f \
+            | tar --no-recursion -T - -cf - \
+        ) | tar -xf - -C "${hdrdir}"
+    fi
+
+    touch "${hdrdir}/Module.symvers"
+    if [ -f "${KDIR}/out/Module.symvers" ]; then
+        cp "${KDIR}/out/Module.symvers" "${hdrdir}/Module.symvers"
+    fi
+
+    if [ -f "${KDIR}/out/.config" ]; then
+        cp "${KDIR}/out/.config" "${hdrdir}/.config"
+    fi
+
+    if [ -f "${KDIR}/out/include/config/kernel.release" ]; then
+        mkdir -p "${hdrdir}/include/config"
+        cp "${KDIR}/out/include/config/kernel.release" \
+           "${hdrdir}/include/config/kernel.release"
+    fi
+
+    # ------------------------------------------------------------------
+    # Step 5: Remove all pre-compiled host binaries (*.o and *.cmd)
+    # ------------------------------------------------------------------
+    echo -e "\n\e[1;93m[*] Removing host-arch object files and cmd caches \e[0m"
+    find "${hdrdir}" -type f \( -name "*.o" -o -name "*.cmd" \) -delete
+
+    # ------------------------------------------------------------------
+    # Step 6: Create symlink for arch/aarch64 -> arch/arm64
+    # ------------------------------------------------------------------
+    if [ ! -e "${hdrdir}/arch/arm64/aarch64" ]; then
+        ln -sf "${hdrdir}/arch/${arch}" "${hdrdir}/arch/aarch64"
+    fi
+
+    # ------------------------------------------------------------------
+    # Step 7: Generate DEBIAN maintainer scripts
+    # ------------------------------------------------------------------
+    cat > "${pkgdir}/DEBIAN/postinst" << POSTINST_EOF
+#!/bin/sh
+set -e
+HEADERS_DIR="/usr/src/linux-headers-${ver}-${codename}"
+KREL="\$(uname -r)"
+MODULES_DIR="/lib/modules/\${KREL}"
+
+echo "Kernel headers: creating build symlink ..."
+mkdir -p "\${MODULES_DIR}"
+ln -sf "\${HEADERS_DIR}" "\${MODULES_DIR}/build"
+echo "Created symlink \${MODULES_DIR}/build -> \${HEADERS_DIR}"
+exit 0
+POSTINST_EOF
+    chmod 755 "${pkgdir}/DEBIAN/postinst"
+
+    cat > "${pkgdir}/DEBIAN/prerm" << PRERM_EOF
+#!/bin/sh
+set -e
+HEADERS_DIR="/usr/src/linux-headers-${ver}-${codename}"
+KREL="\$(uname -r)"
+LINK="/lib/modules/\${KREL}/build"
+
+if [ -L "\${LINK}" ]; then
+    rm -f "\${LINK}"
+    echo "Removed symlink \${LINK}"
+fi
+
+if [ -d "\${HEADERS_DIR}" ]; then
+    rm -rf "\${HEADERS_DIR}"
+    echo "Removed headers directory \${HEADERS_DIR}"
+fi
+exit 0
+PRERM_EOF
+    chmod 755 "${pkgdir}/DEBIAN/prerm"
+
+    cat > "${pkgdir}/DEBIAN/control" << CONTROL_EOF
+Package: linux-headers-${ver}-${codename}
+Version: ${ver}
+Architecture: ${arch}
+Maintainer: ${BUILDER}
+Description: Full kernel headers for ${ver} (${codename})
+ This package provides the complete set of kernel headers required
+ for building out-of-tree kernel modules against arm/arm64 devices.
+CONTROL_EOF
+
+    # ------------------------------------------------------------------
+    # Step 8: Build the .deb package
+    # ------------------------------------------------------------------
+    echo -e "\n\e[1;93m[*] Building .deb package \e[0m"
+    fakeroot dpkg-deb --build "${pkgdir}" "${KDIR}/${pkgname}"
+
+    echo -e "\n\e[1;32m[✓] Kernel Headers built: ${pkgname} \e[0m"
+    if [[ "${HEADERS}" == "1" ]]; then
+        tgs linux-headers-*.deb "*#${kver} ${KBUILD_COMPILER_STRING}*"
+    fi
+} 
+
 # A function to build an AnyKernel3 zip.
 mkzip() {
     if [[ "${TGI}" != "0" ]]; then
@@ -294,7 +551,7 @@ helpmenu() {
 usage: kver=<version number> zipn=<zip name> $0 <arg>
 example: $0 --kver=69 --zipn=Kernel-Beta mcfg
 example: $0 --kver=420 --zipn=Kernel-Beta mcfg img
-example: $0 --kver=69420 --zipn=Kernel-Beta mcfg img mkzip
+example: $0 --kver=69420 --zipn=Kernel-Beta mcfg img hdr mkzip
 example: $0 --kver=1 --zipn=Kernel-Beta --obj=drivers/android/binder.o
 example: $0 --kver=2 --zipn=Kernel-Beta --obj=kernel/sched/
 example: $0 --kver=3 --zipn=Kernel-Beta--upr=r16
@@ -302,6 +559,7 @@ example: $0 --kver=3 --zipn=Kernel-Beta--upr=r16
 	 img    Builds Kernel
 	 dtb    Builds dtb(o).img
 	 mod    Builds out-of-tree modules
+	 hdr    Builds kernel headers
 	 mkzip  Builds anykernel3 zip
 	 --obj  Builds specific driver/subsystem
 	 rgn    Regenerates defconfig
@@ -322,13 +580,14 @@ ndialog() {
     OPTIONS=(1 "Build kernel"
         2 "Build DTBs"
         3 "Build modules"
-        4 "Open menuconfig"
-        5 "Regenerate defconfig"
-        6 "Uprev localversion"
-        7 "Build AnyKernel3 zip"
-        8 "Build a specific object"
-        9 "Clean"
-        10 "Exit"
+	4 "Build kernel headers"
+        5 "Open menuconfig"
+        6 "Regenerate defconfig"
+        7 "Uprev localversion"
+        8 "Build AnyKernel3 zip"
+        9 "Build a specific object"
+        10 "Clean"
+        11 "Exit"
     )
     CHOICE=$(dialog --clear \
         --backtitle "$BACKTITLE" \
@@ -373,11 +632,11 @@ ndialog() {
         else
             clear
             ndialog
-        fi
-        ;;
+	fi
+	;;
     4)
         clear
-        mcfg
+        hdr
         echo -ne "\e[1mPress enter to continue or 0 to exit! \e[0m"
         read -r a1
         if [ "$a1" == "0" ]; then
@@ -389,7 +648,7 @@ ndialog() {
         ;;
     5)
         clear
-        rgn
+        mcfg
         echo -ne "\e[1mPress enter to continue or 0 to exit! \e[0m"
         read -r a1
         if [ "$a1" == "0" ]; then
@@ -400,6 +659,18 @@ ndialog() {
         fi
         ;;
     6)
+        clear
+        rgn
+        echo -ne "\e[1mPress enter to continue or 0 to exit! \e[0m"
+        read -r a1
+        if [ "$a1" == "0" ]; then
+            exit 0
+        else
+            clear
+            ndialog
+        fi
+        ;;
+    7)
         dialog --inputbox --stdout "Enter version number: " 15 50 | tee .t
         ver=$(cat .t)
         clear
@@ -414,7 +685,7 @@ ndialog() {
             ndialog
         fi
         ;;
-    7)
+    8)
         mkzip
         echo -ne "\e[1mPress enter to continue or 0 to exit! \e[0m"
         read -r a1
@@ -425,7 +696,7 @@ ndialog() {
             ndialog
         fi
         ;;
-    8)
+    9)
         dialog --inputbox --stdout "Enter object path: " 15 50 | tee .f
         ob=$(cat .f)
         if [ -z "$ob" ]; then
@@ -443,7 +714,7 @@ ndialog() {
             ndialog
         fi
         ;;
-    9)
+    10)
         clear
         clean
         img
@@ -456,7 +727,7 @@ ndialog() {
             ndialog
         fi
         ;;
-    10)
+    11)
         echo -e "\n\e[1m Exiting YAKB...\e[0m"
         sleep 3
         exit 0
@@ -486,6 +757,9 @@ for arg in "$@"; do
     "mod")
         mod
         ;;
+    "hdr")
+	hdr
+	;;
     "mkzip")
         mkzip
         ;;
