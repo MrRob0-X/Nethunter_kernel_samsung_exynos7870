@@ -1,42 +1,408 @@
-name: Build OneUI Kernel
+name: Automate Kernel Builder
 
 on:
   workflow_dispatch:
+    inputs:
+      run_command:
+        description: 'Build flags'
+        default: 'kver=1 zipn=Nethunter-gtaxlte-3.18.140 bash kramel.sh img dtb hdr mkzip'
+        required: true
+      use_telegram:
+        description: 'Use telegram (requires TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID secrets)'
+        type: boolean
+        default: false  
+      dependencies_command:
+        description: 'install/update dependencies'
+        default: 'sudo apt-get update -y && sudo apt-get install dialog bash sed wget git curl zip tar jq expect make cmake automake autoconf llvm lld lldb clang gcc binutils apt-utils bison perl gperf gawk flex bc python3 zstd openssl unzip cpio bc bison build-essential ccache liblz4-tool libsdl1.2-dev libstdc++6 libxml2 libxml2-utils lzop pngcrush schedtool squashfs-tools xsltproc zlib1g-dev libncurses5-dev bzip2 git gcc g++ libssl-dev gcc-aarch64-linux-gnu gcc-arm-linux-gnueabihf gcc-arm-linux-gnueabi g++-aarch64-linux-gnu g++-arm-linux-gnueabi g++-arm-linux-gnueabihf dwarves libelf-dev dos2unix kmod -y;sudo apt-get autoremove -y'
+        required: false
+      builder_name:
+        description: 'Builder name'
+        required: false
+      defconfig_name:
+        description: 'Defconfig name'
+        required: false
+      repack_boot_img:
+        description: 'Whether to repack boot.img with new kernel'
+        type: boolean
+        default: false
+      built_kernel_path:
+        description: 'Path of built kernel to use in boot.img repacking (default: out/arch/arm64/boot/Image)'
+        default: 'out/arch/arm64/boot/Image'
+        required: false
+      create_release:
+        description: 'Create a GitHub release'
+        type: boolean
+        default: false
+      release_description:
+        description: 'Release description (can include name=ReleaseName tag=v1.0 des=commit in the text)'
+        required: false 
+env:
+  HAS_TELEGRAM_BOT: ${{ secrets.TELEGRAM_BOT_TOKEN != '' }}
+  HAS_TELEGRAM_CHAT: ${{ secrets.TELEGRAM_CHAT_ID != '' }}
+  HAS_TELEGRAM: ${{ secrets.TELEGRAM_BOT_TOKEN != '' && secrets.TELEGRAM_CHAT_ID != '' }}
 
 jobs:
-  build:
+  run-kramel:
     runs-on: ubuntu-latest
 
     steps:
-    - name: Checkout Kernel Source
-      uses: actions/checkout@v3
+      - name: Checkout Repository
+        uses: actions/checkout@v3
 
-    - name: Set up Dependencies
-      run: |
-        sudo apt-get update
-        sudo apt-get install -y bc bison flex libssl-dev make libc6-dev libncurses5-dev git wget curl
+      - name: Run Custom Dependencies
+        if: ${{ github.event.inputs.dependencies_command != '' }}
+        run: |
+          eval "${{ github.event.inputs.dependencies_command }}"
 
-    - name: Cache GCC Toolchain
-      uses: actions/cache@v3
-      with:
-        path: ${{ github.workspace }}/aarch64-linux-android-4.9
-        key: ${{ runner.os }}-toolchain-${{ hashFiles('**/aarch64-linux-android-4.9/**') }}
+      - name: Set Defconfig Name
+        if: ${{ github.event.inputs.defconfig_name != '' }}
+        run: |
+          # Flexible replacement: preserve anything before CONFIG= (like 'export ')
+          sed -i "s/^\(.*CONFIG=\)[^ ]*/\\1${{ github.event.inputs.defconfig_name }}/" kramel.sh
 
-    - name: Clone GCC Toolchain
-      run: |
-        git clone https://github.com/GrowtopiaJaw/aarch64-linux-android-4.9 -b google --depth=1
+      - name: Set Builder Name
+        if: ${{ github.event.inputs.builder_name != '' }}
+        run: |
+          # Set BUILDER variable in kramel.sh, preserving preceding text (e.g., 'export ')
+          sed -i "s/^\(.*BUILDER=\).*/\1\"${{ github.event.inputs.builder_name }}\"/" kramel.sh
 
-    - name: Make build_kernel.sh executable
-      run: chmod +x build_kernel.sh
+          # Get the defconfig name
+          if [ "${{ github.event.inputs.defconfig_name }}" != '' ]; then
+            DEFCONFIG_NAME="${{ github.event.inputs.defconfig_name }}"
+          else
+            # Extract CONFIG value from kramel.sh (matches any line with CONFIG=)
+            DEFCONFIG_NAME=$(grep -oP 'CONFIG=\K[^ ]*' kramel.sh | head -1)
+          fi
 
-    - name: Run Kernel Build Script
-      env:
-        PATH: ${{ github.workspace }}/aarch64-linux-android-4.9/bin:${{ env.PATH }}
-        CROSS_COMPILE: aarch64-linux-android-
-      run: ./build_kernel.sh -j$(nproc)
+          # Set CONFIG_LOCALVERSION in the specific defconfig
+          DEFCONFIG_PATH="arch/arm64/configs/${DEFCONFIG_NAME}"
+          if [ -f "$DEFCONFIG_PATH" ]; then
+            if grep -q "CONFIG_LOCALVERSION" "$DEFCONFIG_PATH"; then
+              sed -i "s/CONFIG_LOCALVERSION=.*/CONFIG_LOCALVERSION=\"-${{ github.event.inputs.builder_name }}\"/" "$DEFCONFIG_PATH"
+            else
+              echo "CONFIG_LOCALVERSION=\"-${{ github.event.inputs.builder_name }}\"" >> "$DEFCONFIG_PATH"
+            fi
+          else
+            echo "Warning: Defconfig file $DEFCONFIG_PATH not found. Cannot update CONFIG_LOCALVERSION."
+          fi
 
-    - name: Upload Kernel Image
-      uses: actions/upload-artifact@v4
-      with:
-        name: kernel-image
-        path: arch/arm64/boot/Image
+      - name: Check Telegram Bot Token
+        if: ${{ github.event.inputs.use_telegram == 'true' }}
+        id: check_telegram_bot
+        run: |
+          if [ -n "${{ secrets.TELEGRAM_BOT_TOKEN }}" ]; then
+            echo "has_bot=true" >> $GITHUB_OUTPUT
+          else
+            echo "has_bot=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Check Telegram Chat ID
+        if: ${{ github.event.inputs.use_telegram == 'true' }}
+        id: check_telegram_chat
+        run: |
+          if [ -n "${{ secrets.TELEGRAM_CHAT_ID }}" ]; then
+            echo "has_chat=true" >> $GITHUB_OUTPUT
+          else
+            echo "has_chat=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Inject Telegram Bot Token into kramel.sh
+        if: ${{ github.event.inputs.use_telegram == 'true' && steps.check_telegram_bot.outputs.has_bot == 'true' }}
+        run: |
+          sed -i "s|bot[^/ ]*|bot${{ secrets.TELEGRAM_BOT_TOKEN }}|" kramel.sh
+
+      - name: Inject Telegram Chat ID into kramel.sh
+        if: ${{ github.event.inputs.use_telegram == 'true' && steps.check_telegram_chat.outputs.has_chat == 'true' }}
+        run: |
+          sed -i "s|CHATID=[^/ ]*|CHATID=${{ secrets.TELEGRAM_CHAT_ID }}|" kramel.sh
+
+      - name: Build kernel
+        run: |
+          eval "${{ github.event.inputs.run_command }}"
+
+      - name: Repack boot.img with new kernel
+        if: ${{ github.event.inputs.repack_boot_img == 'true' }}
+        run: |
+          BOOT_IMG=".github/workflows/boot.img"
+          KERNEL_IMAGE="${{ github.event.inputs.built_kernel_path }}"
+          DTB_IMG="out/arch/arm64/boot/dtb.img"
+          
+          echo "Repacking boot.img: $BOOT_IMG with kernel: $KERNEL_IMAGE"
+          
+          if [ -f "$BOOT_IMG" ]; then
+            git clone --depth=1 https://github.com/MrRob0-X/AIK
+            chmod 0777 -R AIK
+            cd AIK
+            ./unpackimg ../$BOOT_IMG
+            cp -rf ../$KERNEL_IMAGE split/kernel
+            cp -rf ../$DTB_IMG split/dtb
+            ./repackimg
+            mv new-boot.img ../boot.img
+            cd ..
+            echo "Boot.img repacked successfully"
+          else
+            echo "Error: Boot image file $BOOT_IMG not found"
+            exit 1
+          fi
+
+      - name: Send boot.img to Telegram
+        if: ${{ github.event.inputs.repack_boot_img == 'true' && github.event.inputs.use_telegram == 'true' }}
+        run: |
+          if [ -f "boot.img" ]; then
+            echo "Sending boot.img to Telegram..."
+
+            # Get MD5 hash of boot.img
+            MD5=$(md5sum boot.img | cut -d' ' -f1)
+
+            # Send to Telegram using the same format as kramel.sh but without compiler info
+            curl -fsSL -X POST -F document=@boot.img https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendDocument \
+              -F "chat_id=${{ secrets.TELEGRAM_CHAT_ID }}" \
+              -F "parse_mode=Markdown" \
+              -F "caption=\"*MD5*: \`$MD5\`\""
+
+            echo "boot.img sent to Telegram successfully"
+          else
+            echo "Error: boot.img not found"
+            exit 1
+          fi
+
+      - name: Parse Release Information
+        if: ${{ github.event.inputs.create_release == 'true' }}
+        id: release_info
+        run: |
+          DESCRIPTION="${{ github.event.inputs.release_description }}"
+          
+          # Clean up the description first - fix common formatting issues
+          # Remove spaces around equals signs and fix double equals
+          DESCRIPTION=$(echo "$DESCRIPTION" | sed 's/ =/= /g' | sed 's/==/=/g' | sed 's/ = /=/g')
+          
+          # Simple and reliable parsing without complex regex
+          RELEASE_NAME=""
+          RELEASE_TAG=""
+          RELEASE_BODY=""
+          
+          # Extract name (everything after name= until tag= or end)
+          if [[ "$DESCRIPTION" == *"name="* ]]; then
+            TEMP="${DESCRIPTION#*name=}"
+            if [[ "$TEMP" == *" tag="* ]]; then
+              RELEASE_NAME="${TEMP%% tag=*}"
+            elif [[ "$TEMP" == *" des="* ]]; then
+              RELEASE_NAME="${TEMP%% des=*}"
+            else
+              RELEASE_NAME="$TEMP"
+            fi
+          fi
+          
+          # Extract tag (everything after tag= until des= or end)
+          if [[ "$DESCRIPTION" == *"tag="* ]]; then
+            TEMP="${DESCRIPTION#*tag=}"
+            if [[ "$TEMP" == *" des="* ]]; then
+              RELEASE_TAG="${TEMP%% des=*}"
+            else
+              RELEASE_TAG="$TEMP"
+            fi
+          fi
+          
+          # Extract description (everything after des=)
+          if [[ "$DESCRIPTION" == *"des="* ]]; then
+            RELEASE_BODY="${DESCRIPTION#*des=}"
+          fi
+          
+          # Enhanced description handling
+          if [[ "$RELEASE_BODY" == commit* ]]; then
+            # Handle commit-based descriptions
+            if [[ "$RELEASE_BODY" == "commit" ]]; then
+              # Just "commit" - use current commit message
+              RELEASE_BODY=$(git log -1 --pretty=%B)
+              echo "Using current commit message as release description"
+            elif [[ "$RELEASE_BODY" =~ ^commit\((.*)\)$ ]]; then
+              # commit(hash1,hash2,...) - extract specific commit messages
+              COMMIT_HASHES="${BASH_REMATCH[1]}"
+              echo "Extracting commit messages for hashes: $COMMIT_HASHES"
+              RELEASE_BODY=""
+              IFS=',' read -ra HASH_ARRAY <<< "$COMMIT_HASHES"
+              for hash in "${HASH_ARRAY[@]}"; do
+                # Trim whitespace from each hash
+                hash=$(echo "$hash" | xargs)
+                if git rev-parse --verify "$hash" >/dev/null 2>&1; then
+                  commit_msg=$(git log -1 --pretty=format:"**Commit %H**%n%n%s%n%n%b%n---%n" "$hash")
+                  RELEASE_BODY="$RELEASE_BODY$commit_msg"
+                else
+                  echo "Warning: Commit hash $hash not found"
+                  RELEASE_BODY="$RELEASE_BODY**Commit $hash** - NOT FOUND%n---%n"
+                fi
+              done
+              # Convert %n to actual newlines
+              RELEASE_BODY=$(echo "$RELEASE_BODY" | sed 's/%n/\n/g')
+            else
+              # Just "commit" - fallback to current commit
+              RELEASE_BODY=$(git log -1 --pretty=%B)
+              echo "Using current commit message as release description (fallback)"
+            fi
+          else
+            # Handle custom descriptions with newline formatting
+            # Process {newline=N} patterns one by one
+            while [[ "$RELEASE_BODY" =~ \{newline=([0-9]+)\} ]]; do
+              count="${BASH_REMATCH[1]}"
+              # Create the replacement string with the exact number of newlines
+              replacement=""
+              for ((i=0; i<count; i++)); do
+                replacement="${replacement}"$'\n'
+              done
+              # Replace the first occurrence
+              RELEASE_BODY="${RELEASE_BODY/\{newline=$count\}/$replacement}"
+            done
+            
+            # Replace other common markdown-friendly placeholders
+            RELEASE_BODY=$(echo "$RELEASE_BODY" | sed 's/{tab}/    /g')
+            RELEASE_BODY=$(echo "$RELEASE_BODY" | sed 's/{bullet}/• /g')
+            
+            echo "Using custom description with formatting"
+          fi
+
+          # Set default values if not provided
+          if [ -z "$RELEASE_NAME" ]; then
+            RELEASE_NAME="Kernel Build $(date +'%Y-%m-%d')"
+          fi
+          if [ -z "$RELEASE_TAG" ]; then
+            RELEASE_TAG="build-$(date +%s)"
+          fi
+          if [ -z "$RELEASE_BODY" ]; then
+            RELEASE_BODY="Automated kernel build completed on $(date)"
+          fi
+          
+          # Clean up any extra spaces (but preserve newlines)
+          RELEASE_NAME=$(echo "$RELEASE_NAME" | xargs)
+          RELEASE_TAG=$(echo "$RELEASE_TAG" | xargs)
+          
+          # Debug: Show the body with visible newline markers
+          echo "=== Debug: Body content ==="
+          echo "Body length: ${#RELEASE_BODY} characters"
+          echo "Body with visible newlines:"
+          printf "%s" "$RELEASE_BODY" | od -c
+          echo "=== End debug ==="
+          
+          # Use proper multi-line output for GitHub Actions
+          {
+            echo "name=$RELEASE_NAME"
+            echo "tag=$RELEASE_TAG" 
+            echo "body<<RELEASE_BODY_EOF"
+            printf "%s" "$RELEASE_BODY"
+            echo ""
+            echo "RELEASE_BODY_EOF"
+          } >> $GITHUB_OUTPUT
+          
+          echo "Parsed release info:"
+          echo "Name: $RELEASE_NAME"
+          echo "Tag: $RELEASE_TAG" 
+          echo "Body preview (first 200 chars):"
+          echo "${RELEASE_BODY:0:200}"
+
+      - name: Check if Release Files Exist
+        if: ${{ github.event.inputs.create_release == 'true' }}
+        id: check_release_files
+        run: |
+          RELEASE_FILES=""
+
+          # Check for anykernel3 zip files
+          if compgen -G "anykernel3/*.zip" > /dev/null; then
+            echo "Found anykernel3 zip files"
+            for file in anykernel3/*.zip; do
+              RELEASE_FILES="$RELEASE_FILES$file"
+              RELEASE_FILES="$RELEASE_FILES"$'\n'
+            done
+          else
+            echo "No anykernel3 zip files found"
+          fi
+
+          # Check for linux headers deb files
+          if compgen -G "linux-headers-*.deb" > /dev/null; then
+            echo "Found linux headers deb files"
+            for file in linux-headers-*.deb; do
+              RELEASE_FILES="$RELEASE_FILES$file"
+              RELEASE_FILES="$RELEASE_FILES"$'\n'
+            done
+          else
+            echo "No linux headers deb files found"
+          fi
+
+          # Check for new_boot.img (from repack)
+          if [ -f "boot.img" ]; then
+            echo "Found boot.img"
+            RELEASE_FILES="$RELEASE_FILES""boot.img"
+            RELEASE_FILES="$RELEASE_FILES"$'\n'
+          else
+            echo "No boot.img found"
+          fi
+
+          # Remove trailing newline and set output using proper GitHub Actions format
+          RELEASE_FILES="${RELEASE_FILES%$'\n'}"
+          echo "files<<EOF" >> $GITHUB_OUTPUT
+          echo "$RELEASE_FILES" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+          
+          echo "Release files to include:"
+          echo "$RELEASE_FILES"
+
+      - name: Create Release
+        if: ${{ github.event.inputs.create_release == 'true' && steps.check_release_files.outputs.files != '' }}
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: ${{ steps.release_info.outputs.tag }}
+          name: ${{ steps.release_info.outputs.name }}
+          body: |
+            ${{ steps.release_info.outputs.body }}
+          files: ${{ steps.check_release_files.outputs.files }}
+
+      - name: Check if Artifact Files Exist
+        if: ${{ (github.event.inputs.use_telegram != 'true' || steps.check_telegram_bot.outputs.has_bot != 'true' || steps.check_telegram_chat.outputs.has_chat != 'true') && github.event.inputs.create_release != 'true' }}
+        id: check_artifact_files
+        run: |
+          ARTIFACT_FILES=""
+          
+          # Check for anykernel3 zip files
+          if compgen -G "anykernel3/*.zip" > /dev/null; then
+            echo "Found anykernel3 zip files for artifact"
+            for file in anykernel3/*.zip; do
+              ARTIFACT_FILES="$ARTIFACT_FILES$file"
+              ARTIFACT_FILES="$ARTIFACT_FILES"$'\n'
+            done
+          else
+            echo "No anykernel3 zip files found for artifact"
+          fi
+
+          # Check for linux headers deb files
+          if compgen -G "linux-headers-*.deb" > /dev/null; then
+            echo "Found linux headers deb files"
+            for file in linux-headers-*.deb; do
+              ARTIFACT_FILES="$ARTIFACT_FILES$file"
+              ARTIFACT_FILES="$ARTIFACT_FILES"$'\n'
+            done
+          else
+            echo "No linux headers deb files found"
+          fi
+
+          # Check for boot.img (from repack)
+          if [ -f "boot.img" ]; then
+            echo "Found boot.img"
+            ARTIFACT_FILES="$ARTIFACT_FILES""boot.img"
+            ARTIFACT_FILES="$ARTIFACT_FILES"$'\n'
+          else
+            echo "No boot.img found"
+          fi
+          
+          # Remove trailing newline and set output using proper GitHub Actions format
+          ARTIFACT_FILES="${ARTIFACT_FILES%$'\n'}"
+          echo "files<<EOF" >> $GITHUB_OUTPUT
+          echo "$ARTIFACT_FILES" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+          
+          echo "Artifact files to include:"
+          echo "$ARTIFACT_FILES"
+
+      - name: Upload Kernel Artifacts if Telegram not used and no Release
+        if: ${{ (github.event.inputs.use_telegram != 'true' || steps.check_telegram_bot.outputs.has_bot != 'true' || steps.check_telegram_chat.outputs.has_chat != 'true') && github.event.inputs.create_release != 'true' && steps.check_artifact_files.outputs.files != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernel-build
+          path: ${{ steps.check_artifact_files.outputs.files }}
