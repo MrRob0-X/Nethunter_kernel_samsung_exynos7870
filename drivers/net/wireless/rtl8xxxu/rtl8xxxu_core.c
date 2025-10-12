@@ -4714,7 +4714,7 @@ static void rtl8xxxu_set_basic_rates(struct rtl8xxxu_priv *priv, u32 rate_cfg)
 
 	val32 = rtl8xxxu_read32(priv, REG_RESPONSE_RATE_SET);
 #if LINUX_VERSION_CODE > KERNEL_VERSION(3,9,11)
-	if (hw->conf.chandef.chan->band == NL80211_BAND_5GHZ)
+	if (hw->conf.chandef.chan->band == (enum ieee80211_band)NL80211_BAND_5GHZ)
 #else
 	if (hw->conf.channel->band == IEEE80211_BAND_5GHZ)
 #endif
@@ -4738,7 +4738,7 @@ rtl8xxxu_wireless_mode(struct ieee80211_hw *hw, struct ieee80211_sta *sta)
 {
 	u16 network_type = WIRELESS_MODE_UNKNOWN;
 #if LINUX_VERSION_CODE > KERNEL_VERSION(3,9,11)
-	if (hw->conf.chandef.chan->band == NL80211_BAND_5GHZ) {
+	if (hw->conf.chandef.chan->band == (enum ieee80211_band)NL80211_BAND_5GHZ) {
 #else
 	if (hw->conf.channel->band == IEEE80211_BAND_5GHZ) {
 #endif
@@ -4815,7 +4815,7 @@ static void rtl8xxxu_set_aifs(struct rtl8xxxu_priv *priv, u8 slot_time)
 	}
 
 #if LINUX_VERSION_CODE > KERNEL_VERSION(3,9,11)
-	if (priv->hw->conf.chandef.chan->band == NL80211_BAND_5GHZ ||
+	if (priv->hw->conf.chandef.chan->band == (enum ieee80211_band)NL80211_BAND_5GHZ ||
 #else
 	if (priv->hw->conf.channel->band == IEEE80211_BAND_5GHZ ||
 #endif
