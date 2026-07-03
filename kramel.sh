@@ -68,7 +68,7 @@ fi
 
 if [[ "${COMPILER}" = gcc ]]; then
     if [ ! -d "${KDIR}/gcc64" ]; then
-        wget -O 64.tar.xz https://releases.linaro.org/components/toolchain/binaries/4.9-2016.02/aarch64-linux-gnu/gcc-linaro-4.9-2016.02-x86_64_aarch64-linux-gnu.tar.xz && tar -xf 64.tar.xz
+        wget -O 64.tar.xz https://developer.arm.com/-/cdn-downloads/permalink/legacy-linaro-gnu-toolchains/4.9-2016.02/gcc-linaro-4.9-2016.02-x86_64_aarch64-linux-gnu.tar.xz && tar -xf 64.tar.xz
         mv "${KDIR}"/gcc-linaro-4.9-2016.02-x86_64_aarch64-linux-gnu "${KDIR}"/gcc64 && rm -rf 64.tar.xz
     fi
 
